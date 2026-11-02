@@ -1,0 +1,77 @@
+# Para desarrollar en tu máquina alcanza con la base:  docker compose up -d db
+# Para correr todo junto (app + migraciones + worker):    docker compose up -d --build
+name: admin-deposito
+
+x-database-url: &database-url postgresql://${POSTGRES_USER:-hub}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-hub}?schema=public
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Definí POSTGRES_PASSWORD en .env}
+      POSTGRES_DB: ${POSTGRES_DB:-hub}
+      TZ: America/Argentina/Buenos_Aires
+    ports:
+      # Solo accesible desde esta máquina
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
+    volumes:
+      - hub_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Aplica las migraciones versionadas y termina. También sirve para el seed:
+  #   docker compose run --rm migrate npm run db:seed
+  migrate:
+    build:
+      context: .
+      target: tools
+    restart: "no"
+    environment:
+      DATABASE_URL: *database-url
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+      target: runner
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-3100}:3100"
+    environment:
+      DATABASE_URL: *database-url
+      SESSION_SECRET: ${SESSION_SECRET:?Definí SESSION_SECRET en .env (mínimo 32 caracteres)}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      TZ: America/Argentina/Buenos_Aires
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Procesa tareas en segundo plano (entregas de webhooks con reintentos, fase 3).
+  worker:
+    build:
+      context: .
+      target: tools
+    command: ["npx", "tsx", "scripts/worker.ts"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: *database-url
+      TZ: America/Argentina/Buenos_Aires
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  hub_pgdata:

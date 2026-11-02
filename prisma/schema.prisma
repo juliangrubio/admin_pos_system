@@ -1,0 +1,204 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  EMPLOYEE
+}
+
+// Usuarios del hub: independientes de los de las unidades de negocio.
+model User {
+  id             String          @id @default(cuid())
+  // Con qué inicia sesión: un email (ana@empresa.com) o un nombre de usuario (ana). Siempre en minúsculas
+  // y único (hay CHECK en la migración). Un nombre de usuario nunca lleva "@": no se confunde con un email.
+  username       String          @unique
+  name           String
+  passwordHash   String
+  role           UserRole        @default(EMPLOYEE)
+  isActive       Boolean         @default(true)
+  // Se incrementa para invalidar todas las sesiones del usuario (cambio de clave, baja).
+  tokenVersion   Int             @default(0)
+  lastLoginAt    DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  auditLogs      AuditLog[]
+  stockMovements StockMovement[]
+}
+
+// Unidad de negocio (Chill, su clon, etc.). La integración (claves, secretos, webhooks) llega en la fase 3.
+model BusinessUnit {
+  id         String      @id @default(cuid())
+  // Código estable y único (ej. CHILL). Es la clave compartida con la app de la unidad.
+  code       String      @unique
+  name       String
+  isActive   Boolean     @default(true)
+  apiBaseUrl String?
+  webhookUrl String?
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  warehouses Warehouse[]
+}
+
+// Quién, qué y cuándo. Solo se agrega: la migración bloquea UPDATE y DELETE.
+model AuditLog {
+  id         String   @id @default(cuid())
+  action     String
+  // Nulo cuando lo hace el sistema o un intento de acceso sin usuario identificado.
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: Restrict)
+  entityType String?
+  entityId   String?
+  metadata   Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@index([userId, createdAt])
+}
+
+// ─── Stock ────────────────────────────────────────────────────────────────────
+
+enum MeasureUnit {
+  KG
+  LITER
+  UNIT
+}
+
+enum WarehouseType {
+  PRODUCTION // uno por rubro; siempre de un rubro
+  STORAGE
+  BRANCH // solo para depósitos de una unidad de negocio
+  WASTE // se muestra como "Bajas"; uno por rubro; siempre de un rubro
+}
+
+enum StockMovementType {
+  PURCHASE_IN
+  REMITO_OUT
+  REMITO_CANCEL_IN
+  ADJUSTMENT
+  WASTE_OUT
+  TRANSFER
+}
+
+// Rubro de un insumo, en dos niveles: rubro (parentId nulo, ej. "Alimentos") y subrubro (cuelga de un rubro,
+// ej. "Lácteos"). Máximo dos niveles (lo fuerza un trigger en la migración). También puede restringir un depósito:
+// atado a un rubro admite sus insumos y los de todos sus subrubros; atado a un subrubro, solo los de ese subrubro.
+// Hoy es solo clasificación: no está atado a una unidad de negocio.
+model InsumoCategory {
+  id         String           @id @default(cuid())
+  // Único entre hermanos y sin distinguir mayúsculas (índice en la migración).
+  name       String
+  parentId   String?
+  parent     InsumoCategory?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children   InsumoCategory[] @relation("CategoryTree")
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+  insumos    Insumo[]
+  warehouses Warehouse[]
+
+  @@index([parentId])
+}
+
+// Catálogo central de insumos. `code` es la clave compartida con las unidades: único y estable.
+model Insumo {
+  id           String          @id @default(cuid())
+  code         String          @unique
+  // Único sin distinguir mayúsculas (índice en la migración).
+  name         String
+  unit         MeasureUnit
+  categoryId   String?
+  category     InsumoCategory? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  isActive     Boolean         @default(true)
+  // Se compara contra el stock total de los depósitos centrales (sin Bajas).
+  minStock     Decimal         @default(0) @db.Decimal(12, 3)
+  // Costo promedio ponderado por unidad de medida, en centavos.
+  avgCostCents Int             @default(0)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  levels       StockLevel[]
+  movements    StockMovement[]
+
+  @@index([categoryId])
+}
+
+// businessUnitId nulo = depósito central (acá hay stock). Con valor = depósito de una unidad,
+// registrado solo como destino de remitos: no tiene saldos en esta base.
+model Warehouse {
+  id             String          @id @default(cuid())
+  // Estable y único. En los depósitos de una unidad coincide con el código en la app de la unidad.
+  code           String          @unique
+  name           String
+  type           WarehouseType
+  address        String?
+  phone          String?
+  notes          String?
+  isActive       Boolean         @default(true)
+  businessUnitId String?
+  businessUnit   BusinessUnit?   @relation(fields: [businessUnitId], references: [id], onDelete: Restrict)
+  // Restricción por rubro: si está, el depósito solo admite insumos de ese rubro (y de sus subrubros). Es opcional,
+  // salvo en los depósitos centrales de Bajas y de Producción, donde es obligatoria y de un rubro de nivel superior
+  // (uno de cada tipo por rubro: ver la migración warehouse_per_rubro).
+  categoryId     String?
+  category       InsumoCategory? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  levels         StockLevel[]
+  movementsFrom  StockMovement[] @relation("MovementFrom")
+  movementsTo    StockMovement[] @relation("MovementTo")
+
+  @@index([businessUnitId])
+}
+
+// Saldo por depósito e insumo. Solo depósitos centrales. Siempre es la suma de los movimientos:
+// se actualiza en la misma transacción que el movimiento (src/lib/stock/ledger.ts).
+model StockLevel {
+  id          String    @id @default(cuid())
+  warehouseId String
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  insumoId    String
+  insumo      Insumo    @relation(fields: [insumoId], references: [id], onDelete: Restrict)
+  quantity    Decimal   @default(0) @db.Decimal(12, 3)
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([warehouseId, insumoId])
+  @@index([insumoId])
+}
+
+// Libro de movimientos: inmutable (la migración bloquea UPDATE y DELETE). La cantidad es siempre
+// positiva y el sentido lo da el origen y el destino; un lado nulo significa "fuera de los depósitos
+// centrales" (una compra que entra, mercadería en tránsito hacia una unidad).
+model StockMovement {
+  id              String            @id @default(cuid())
+  type            StockMovementType
+  insumoId        String
+  insumo          Insumo            @relation(fields: [insumoId], references: [id], onDelete: Restrict)
+  fromWarehouseId String?
+  fromWarehouse   Warehouse?        @relation("MovementFrom", fields: [fromWarehouseId], references: [id], onDelete: Restrict)
+  toWarehouseId   String?
+  toWarehouse     Warehouse?        @relation("MovementTo", fields: [toWarehouseId], references: [id], onDelete: Restrict)
+  quantity        Decimal           @db.Decimal(12, 3)
+  // Costo promedio por unidad de medida (centavos) al momento del movimiento.
+  unitCostCents   Int?
+  // A qué operación pertenece (compra, remito, ajuste). Ver STOCK_REFERENCE en src/lib/stock.
+  referenceType   String?
+  referenceId     String?
+  // Código del motivo (obligatorio en ajustes y bajas). Ver src/lib/stock/reasons.ts.
+  reason          String?
+  note            String?
+  userId          String
+  user            User              @relation(fields: [userId], references: [id], onDelete: Restrict)
+  createdAt       DateTime          @default(now())
+
+  @@index([insumoId, createdAt])
+  @@index([fromWarehouseId, createdAt])
+  @@index([toWarehouseId, createdAt])
+  @@index([createdAt])
+  @@index([referenceType, referenceId])
+}
