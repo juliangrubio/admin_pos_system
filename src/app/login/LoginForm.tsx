@@ -46,7 +46,7 @@ export default function LoginForm() {
   return (
     <form onSubmit={handleSubmit} className='space-y-4'>
       <div className='space-y-2'>
-        <Label htmlFor='username'>Email o usuario</Label>
+        <Label htmlFor='username'>Email o Alias</Label>
         <Input
           id='username'
           type='text'
